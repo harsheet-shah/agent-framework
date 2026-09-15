@@ -1,9 +1,11 @@
 # Copyright (c) Microsoft. All rights reserved.
 
 
+import asyncio
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Generic, Protocol, TypeVar
+from typing import ClassVar, Generic, Protocol, TypeVar
+from weakref import WeakKeyDictionary
 
 from agent_framework import (
     AgentSession,
@@ -300,32 +302,65 @@ class FoundryAgentSessionStore(SessionStore):
 
     DEFAULT_ROOT_SCOPE = "agent_sessions"
 
+    # Cache the backing ``FoundryStateStore`` per (event loop, scope). The store
+    # owns an async pipeline + credential bound to the loop it was created on, so
+    # it must never be reused from a different loop (e.g. across ``asyncio.run()``
+    # calls, or between loop-scoped tests) -- keying by the running loop prevents
+    # that and lets a closed loop's store be garbage-collected along with it.
+    # Keying by scope keeps a subclass that overrides ``DEFAULT_ROOT_SCOPE``
+    # isolated to its own collection rather than sharing (or clobbering) the base
+    # store.
+    #
+    # Within the long-running server (a single loop) every request shares one
+    # store, so the per-request credential rebuild + ``agent_sessions`` metadata
+    # round-trip that ``get_or_create`` would otherwise repeat is paid just once.
+    _store_cache: ClassVar[
+        "WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, FoundryStateStore]]"
+    ] = WeakKeyDictionary()
+    _cache_locks: ClassVar["WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]"] = WeakKeyDictionary()
+
     def __init__(self, platform_context: FoundryAgentRequestContext) -> None:
         self.platform_context = platform_context
 
+    @classmethod
+    def _loop_lock(cls, loop: "asyncio.AbstractEventLoop") -> asyncio.Lock:
+        lock = cls._cache_locks.get(loop)
+        if lock is None:
+            # ``setdefault`` collapses a concurrent first-use to a single lock.
+            lock = cls._cache_locks.setdefault(loop, asyncio.Lock())
+        return lock
+
     async def _get_store(self) -> FoundryStateStore:
-        return await FoundryStateStore.get_or_create(
-            f"{self.DEFAULT_ROOT_SCOPE}",
-            user_isolation=True,
-        )
+        loop = asyncio.get_running_loop()
+        scope = self.DEFAULT_ROOT_SCOPE
+        # Fast path: already resolved on this loop -> no lock, no round-trip.
+        by_scope = FoundryAgentSessionStore._store_cache.get(loop)
+        if by_scope is not None and scope in by_scope:
+            return by_scope[scope]
+        async with self._loop_lock(loop):
+            by_scope = FoundryAgentSessionStore._store_cache.setdefault(loop, {})
+            if scope not in by_scope:
+                by_scope[scope] = await FoundryStateStore.get_or_create(scope, user_isolation=True)
+        return by_scope[scope]
 
     async def get(self, session_id: str) -> AgentSession | None:
+        # The shared store is intentionally NOT entered as an ``async with``
+        # context manager: its ``__aexit__`` calls ``aclose()``, which would
+        # close the pooled pipeline + owned credential and defeat the cache. It
+        # stays open for the life of its event loop and is reclaimed with it.
         store = await self._get_store()
-        async with store:
-            item = await store.get_item(session_id, call_id=self.platform_context.call_id)
+        item = await store.get_item(session_id, call_id=self.platform_context.call_id)
         if item is None:
             return None
         return AgentSession.from_dict(item.value)
 
     async def set(self, session_id: str, session: AgentSession) -> None:
         store = await self._get_store()
-        async with store:
-            await store.set_item(session_id, session.to_dict(), call_id=self.platform_context.call_id)
+        await store.set_item(session_id, session.to_dict(), call_id=self.platform_context.call_id)
 
     async def delete(self, session_id: str) -> None:
         store = await self._get_store()
-        async with store:
-            await store.delete_item(session_id, call_id=self.platform_context.call_id)
+        await store.delete_item(session_id, call_id=self.platform_context.call_id)
 
 
 class AgentSessionStoreProvider(StoreProvider[SessionStore]):
